@@ -15,10 +15,11 @@ from litellm.types.utils import ChatCompletionMessageToolCall
 from fraim.core.history import EventRecord, History
 from fraim.core.llms.base import BaseLLM
 from fraim.core.llms.cache import LLMCache
+from fraim.core.llms.exceptions import AIUsageCapError
 from fraim.core.messages import AssistantMessage, Function, Message, ToolCall
 from fraim.core.messages.message import ThinkingBlock
 from fraim.core.tools import BaseTool, execute_tool_calls
-from fraim.core.utils.retry.http import should_retry_request as should_retry_http_request
+from fraim.core.utils.retry.http import is_quota_cap_error, should_retry_request as should_retry_http_request
 from fraim.core.utils.retry.tenacity import with_retry
 
 
@@ -71,7 +72,7 @@ class LiteLLM(BaseLLM):
         additional_model_params: dict[str, Any] | None = None,
         max_tool_iterations: int = 25,
         tools: Iterable[BaseTool] | None = None,
-        max_retries: int = 5,
+        max_retries: int = 2,
         base_delay: float = 1.0,
         max_delay: float = 120.0,
     ):
@@ -136,7 +137,20 @@ class LiteLLM(BaseLLM):
 
         thought_record = EventRecord(description="Thinking...")
         history.append_record(thought_record)
-        response = await completion(**completion_params)
+        try:
+            response = await completion(**completion_params)
+        except Exception as exc:
+            if is_quota_cap_error(exc):
+                provider = getattr(exc, "llm_provider", "") or (self.model.split("/")[0] if "/" in self.model else "")
+                model_name = self.model or getattr(exc, "model", "")
+                err_msg = getattr(exc, "message", "") or str(exc)
+                raise AIUsageCapError(
+                    message=err_msg,
+                    provider=provider,
+                    model=model_name,
+                    details=str(exc),
+                ) from exc
+            raise
         thought_record.description = f"Thought for {thought_record.elapsed_seconds():.0f} seconds."
 
         # Calculate and track cost for this completion

@@ -10,7 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from fraim.core.utils.retry.http import parse_retry_header, should_retry_request
+from fraim.core.utils.retry.http import is_quota_cap_error, parse_retry_header, should_retry_request
 
 
 class MockException(Exception):
@@ -305,8 +305,9 @@ class TestParseRetryHeader:
 class MockExceptionWithStatus(Exception):
     """Mock exception class with status code for testing should_retry_request"""
 
-    def __init__(self, status_code: int | None = None, status: int | None = None):
-        super().__init__()
+    def __init__(self, status_code: int | None = None, status: int | None = None, message: str = ""):
+        super().__init__(message)
+        self.message = message
         self.response = Mock()
         if status_code is not None:
             self.response.status_code = status_code
@@ -489,3 +490,45 @@ class TestShouldRetryRequest:
         exception = MockExceptionWithStatus()
         result = should_retry_request(exception)
         assert result is False
+
+
+class TestQuotaCapDetection:
+    """Test cases for identifying non-retriable quota/billing cap errors"""
+
+    def test_litellm_budget_exceeded_error_is_quota_cap(self) -> None:
+        """BudgetExceededError should be detected as quota cap and NOT retried"""
+        import litellm.exceptions as le
+
+        exc = le.BudgetExceededError(current_cost=10.0, max_budget=5.0)
+        assert is_quota_cap_error(exc) is True
+        assert should_retry_request(exc) is False
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "You exceeded your current quota, please check your plan and billing details.",
+            "insufficient_quota",
+            "RESOURCE_EXHAUSTED",
+            "Quota exceeded for quota metric 'Queries' and limit 'Queries per day'",
+            "Your credit balance is too low to access the Claude API.",
+            "credit_balance_too_low",
+            "Monthly budget limit reached",
+        ],
+    )
+    def test_quota_cap_messages_in_rate_limit_error(self, message: str) -> None:
+        """RateLimitError with hard quota/billing message should NOT be retried"""
+        import litellm.exceptions as le
+
+        exc = le.RateLimitError(message=message, llm_provider="test", model="test")
+        assert is_quota_cap_error(exc) is True
+        assert should_retry_request(exc) is False
+
+    def test_transient_rate_limit_error_is_retriable(self) -> None:
+        """Standard transient 429 rate limit (e.g. RPM spike) should still be retried"""
+        import litellm.exceptions as le
+
+        exc = le.RateLimitError(
+            message="Rate limit reached for requests per minute. Try again in 2s.", llm_provider="test", model="test"
+        )
+        assert is_quota_cap_error(exc) is False
+        assert should_retry_request(exc) is True

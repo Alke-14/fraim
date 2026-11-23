@@ -3,6 +3,7 @@
 
 """Utility functions for HTTP retry logic and extracting retry-after duration from LiteLLM RateLimitError"""
 
+import re
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -24,9 +25,48 @@ except ImportError:
     requests = None  # type: ignore
 
 
-def parse_retry_header(exception: BaseException) -> timedelta | None:
+QUOTA_CAP_PATTERNS = [
+    re.compile(r"insufficient_quota", re.IGNORECASE),
+    re.compile(r"exceeded your current quota", re.IGNORECASE),
+    re.compile(r"check your plan and billing details", re.IGNORECASE),
+    re.compile(r"resource_exhausted", re.IGNORECASE),
+    re.compile(r"queries per day", re.IGNORECASE),
+    re.compile(r"credit_balance_too_low", re.IGNORECASE),
+    re.compile(r"credit balance is too low", re.IGNORECASE),
+    re.compile(r"budget limit reached", re.IGNORECASE),
+    re.compile(r"budget_exceeded", re.IGNORECASE),
+]
+
+
+def is_quota_cap_error(exception: BaseException) -> bool:
+    """Determine if an exception represents a hard quota, billing, or budget ceiling.
+
+    Unlike transient rate limits (e.g. temporary requests-per-minute spikes),
+    quota cap errors will never succeed upon immediate retrying and require developer
+    or account billing action.
     """
-    Extracts a normalized retry-after duration from an exception with an HTTP response.
+    # 1. Direct LiteLLM BudgetExceededError type
+    exc_type_name = type(exception).__name__
+    if exc_type_name == "BudgetExceededError":
+        return True
+
+    # 2. Inspect string representation and message attributes
+    msg_parts = [str(exception)]
+    message_attr = getattr(exception, "message", None)
+    if message_attr and isinstance(message_attr, str):
+        msg_parts.append(message_attr)
+
+    body_attr = getattr(exception, "body", None)
+    if body_attr:
+        msg_parts.append(str(body_attr))
+
+    combined_text = " ".join(msg_parts)
+
+    return any(pattern.search(combined_text) for pattern in QUOTA_CAP_PATTERNS)
+
+
+def parse_retry_header(exception: BaseException) -> timedelta | None:
+    """Extracts a normalized retry-after duration from an exception with an HTTP response.
 
     Works with requests, httpx, and aiohttp response objects.
 
@@ -62,16 +102,22 @@ def parse_retry_header(exception: BaseException) -> timedelta | None:
 
 
 def should_retry_request(exception: BaseException) -> bool:
-    """
-    Determine if the request should be retried based on the exception type (for network errors) and
+    """Determine if the request should be retried based on the exception type (for network errors) and
+
     HTTP status codes (for API errors).
 
     Retries on:
-    - HTTP status codes: 408 (Request Timeout), 409 (Conflict), 429 (Too Many Requests), 500+ (Server Errors)
+    - HTTP status codes: 408 (Request Timeout), 409 (Conflict), 429 (Too Many Requests, non-quota), 500+ (Server Errors)
     - aiohttp connection/timeout errors
     - httpx.TransportError
     - requests connection/timeout errors
+
+    Does NOT retry on:
+    - Quota, budget, or billing caps (e.g., insufficient_quota, RESOURCE_EXHAUSTED daily caps)
     """
+    # Hard quota/billing cap errors must never be retried
+    if is_quota_cap_error(exception):
+        return False
 
     # Check for HTTP status codes (this covers all retriable LiteLLM exceptions)
     status_code = _get_status_code(exception)
@@ -105,12 +151,10 @@ def should_retry_request(exception: BaseException) -> bool:
 
 
 def _get_response(exception: BaseException) -> Any | None:
-    """
-    Get the response from an exception with an HTTP response
+    """Get the response from an exception with an HTTP response
 
     Handles requests, httpx, and aiohttp exceptions.
     """
-
     # All HTTP requests exceptions will extend Exception
     if not isinstance(exception, Exception):
         return None
@@ -119,12 +163,10 @@ def _get_response(exception: BaseException) -> Any | None:
 
 
 def _get_headers(exception: BaseException) -> Mapping[str, str] | None:
-    """
-    Get the response headers from an exception with an HTTP response.
+    """Get the response headers from an exception with an HTTP response.
 
     Handles requests, httpx, and aiohttp exceptions.
     """
-
     response = _get_response(exception)
     if response is None:
         return None
@@ -137,12 +179,10 @@ def _get_headers(exception: BaseException) -> Mapping[str, str] | None:
 
 
 def _get_status_code(exception: BaseException) -> int | None:
-    """
-    Get the status code from an exception with an HTTP response
+    """Get the status code from an exception with an HTTP response
 
     Handles requests, httpx, and aiohttp exceptions.
     """
-
     response = _get_response(exception)
     if response is None:
         return None
