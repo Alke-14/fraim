@@ -16,17 +16,35 @@ import click
 import typer
 from rich.console import Console
 from rich.live import Live
+from rich.panel import Panel
 from typer.core import TyperCommand, TyperGroup
 
 from fraim.cli.adapters import TyperOptionsAdapter
 from fraim.cli.utils.display import buffered_stdout
 from fraim.core.display import HistoryView
+from fraim.core.llms.exceptions import AIUsageCapError
 from fraim.core.workflows.discovery import discover_workflows
 
 logger = logging.getLogger(__name__)
 
 # Adapter for converting workflow Options to CLI parameters
 adapter = TyperOptionsAdapter()
+
+
+def _display_quota_cap_error(err: AIUsageCapError) -> None:
+    """Display a clean, formatted diagnostic banner for AI quota exhaustion."""
+    err_console = Console(stderr=True)
+    body = (
+        f"[bold red]AI Provider Quota / Billing Cap Reached[/bold red]\n\n"
+        f"• [bold]Provider:[/bold] {err.provider or 'Unknown'}\n"
+        f"• [bold]Model:[/bold] {err.model or 'Unknown'}\n"
+        f"• [bold]Details:[/bold] {err.message}\n\n"
+        f"[bold yellow]Actionable Next Steps:[/bold yellow]\n"
+        f"  1. Check your account billing dashboard or increase your credit limits.\n"
+        f"  2. Switch to an available alternative model via [bold]--model[/bold] (e.g., [green]--model gemini/gemini-flash-latest[/green]).\n"
+        f"  3. Retry once the usage window resets or contact your provider administrator.\n"
+    )
+    err_console.print(Panel(body, title="[bold red]✖ Execution Halted[/bold red]", border_style="red", expand=False))
 
 
 class LazyWorkflowGroup(TyperGroup):
@@ -151,6 +169,10 @@ def _create_workflow_command(workflow_name: str, workflow_class: Any) -> TyperCo
             except KeyboardInterrupt:
                 logger.info("Workflow cancelled")
                 raise typer.Exit(code=1)
+            except AIUsageCapError as e:
+                logger.error(f"Workflow halted: {e!s}")
+                _display_quota_cap_error(e)
+                raise typer.Exit(code=1) from e
             except Exception as e:
                 logger.error(f"Workflow error: {e!s}")
                 raise

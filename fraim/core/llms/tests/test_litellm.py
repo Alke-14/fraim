@@ -742,3 +742,29 @@ class TestLiteLLMRetry:
             # Should succeed after retry
             assert result == mock_response
             assert mock_completion.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_quota_cap_error_circuit_breaker(self) -> None:
+        """Test that quota cap error terminates immediately without retrying and raises AIUsageCapError"""
+        from litellm.exceptions import RateLimitError
+
+        from fraim.core.llms.exceptions import AIUsageCapError
+
+        llm = LiteLLM(model="anthropic/claude-sonnet-4-0", max_retries=2)
+        messages: list[Message] = [UserMessage(content="Hello")]
+
+        quota_error = RateLimitError(
+            message="Your credit balance is too low to access the Claude API.",
+            llm_provider="anthropic",
+            model="claude-sonnet-4-0",
+        )
+
+        with patch("litellm.acompletion", side_effect=quota_error) as mock_completion:
+            with pytest.raises(AIUsageCapError) as exc_info:
+                await llm.run(History(), messages)
+
+            # Circuit breaker: must NOT retry, called only once!
+            assert mock_completion.call_count == 1
+            assert exc_info.value.provider == "anthropic"
+            assert exc_info.value.model == "anthropic/claude-sonnet-4-0"
+            assert "credit balance is too low" in str(exc_info.value)
